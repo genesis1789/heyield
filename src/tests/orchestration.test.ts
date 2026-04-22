@@ -4,13 +4,16 @@ import { initialState, transition } from "@/lib/state/machine";
 import type { DemoState } from "@/lib/state/types";
 
 /**
- * End-to-end happy path using mock adapters. Exercises the same transitions
- * the dashboard drives: CALL_STARTED → RECOMMENDATION_READY → USER_CONFIRMED
- * → APPROVAL_APPROVED → completed. The concierge agent layer is simulated
- * via direct adapter calls so the test is hermetic.
+ * End-to-end happy path using simulator adapters. Exercises the same
+ * transitions the dashboard drives: CALL_STARTED → RECOMMENDATION_READY
+ * → USER_CONFIRMED → PAYMENT_RECEIVED → CRYPTO_IN_FLIGHT → INVESTED.
+ * The concierge agent layer is simulated via direct adapter calls.
+ *
+ * Each `buildTestProviders()` call gets a unique file-store so parallel
+ * vitest workers never race on the same funding-sessions file.
  */
-describe("happy-path orchestration with mocks", () => {
-  it("drives from call start to completed with a tapped approval", async () => {
+describe("happy-path orchestration with simulator funding", () => {
+  it("drives from call start to invested with a Revolut sandbox tap", async () => {
     const { providers } = buildTestProviders();
     const visited: DemoState["status"][] = [];
     let state = initialState();
@@ -21,7 +24,6 @@ describe("happy-path orchestration with mocks", () => {
 
     step({ type: "CALL_STARTED" });
 
-    // Agent runs `recommend` tool → picks opportunity + creates intent.
     const [opp] = await providers.earn.listOpportunities();
     expect(opp.name).toBe("Aave v3 USDC");
     const intent = await providers.intentFactory.createIntent({
@@ -33,41 +35,43 @@ describe("happy-path orchestration with mocks", () => {
     expect(intent.id).toMatch(/^intent_demo_/);
     step({ type: "RECOMMENDATION_READY" });
 
-    // Caller says yes → agent runs `createApproval`.
     step({ type: "USER_CONFIRMED" });
-    const approval = await providers.revolut.requestApproval({
+    const session = await providers.funding.createSession({
       intentId: intent.id,
-      amountFiat: intent.expectedUsdcAmount,
+      amountFiat: 1000,
       fiatCurrency: "EUR",
+      productName: opp.name,
     });
-    expect(approval.approvalId).toMatch(/^approval_demo_/);
-    expect(approval.status).toBe("pending");
+    expect(session.sessionId).toMatch(/^fund_sim_/);
+    expect(session.status).toBe("awaiting_checkout");
+    expect(session.checkoutUrl).toContain(`/checkout/${session.sessionId}`);
 
-    // User taps Approve on the mock push.
-    const tapped =
-      "recordTap" in providers.revolut
-        ? (providers.revolut as { recordTap: (id: string, d: "approve" | "decline") => unknown }).recordTap(
-            approval.approvalId,
-            "approve",
-          )
-        : null;
-    expect(tapped).not.toBeNull();
+    // Sandbox "Pay" click → advance_payment.
+    const paid = await providers.funding.advance!(session.sessionId, {
+      type: "confirm_payment",
+    });
+    expect(paid?.status).toBe("payment_received");
+    step({ type: "PAYMENT_RECEIVED" });
 
-    const settled = await providers.revolut.getApprovalStatus(approval.approvalId);
-    expect(settled.status).toBe("approved");
-    step({ type: "APPROVAL_APPROVED" });
+    // Simulator uses timestamp-based progression. With stepMs=0 the next
+    // poll should land us squarely on invested.
+    const settled = await providers.funding.getSession(session.sessionId);
+    expect(settled?.status).toBe("invested");
+    expect(settled?.txHash).toMatch(/^0x[0-9a-f]+$/);
+    step({ type: "INVESTED" });
 
-    expect(state.status).toBe("completed");
+    expect(state.status).toBe("invested");
     expect(visited).toEqual([
       "call_active",
       "recommended",
-      "approval_pending",
-      "completed",
+      "awaiting_checkout",
+      "payment_received",
+      "invested",
     ]);
   });
 
-  it("demoable decline: forceFailure auto-declines the approval on first poll", async () => {
-    const { providers, mockConfig } = buildTestProviders({ forceFailure: true });
+  it("demoable failure: force-failure flips the sandbox tap to failed", async () => {
+    const { providers } = buildTestProviders({ forceFailure: true });
 
     const [opp] = await providers.earn.listOpportunities();
     const intent = await providers.intentFactory.createIntent({
@@ -76,26 +80,28 @@ describe("happy-path orchestration with mocks", () => {
       fiatCurrency: "EUR",
       userRef: "orch-test",
     });
-    const approval = await providers.revolut.requestApproval({
+    const session = await providers.funding.createSession({
       intentId: intent.id,
-      amountFiat: intent.expectedUsdcAmount,
+      amountFiat: 1000,
       fiatCurrency: "EUR",
+      productName: opp.name,
     });
 
-    expect(mockConfig.forceFailure).toBe(true);
-    const result = await providers.revolut.getApprovalStatus(approval.approvalId);
-    expect(result.status).toBe("declined");
-    expect(result.errorMessage).toMatch(/declined/i);
+    const result = await providers.funding.advance!(session.sessionId, {
+      type: "confirm_payment",
+    });
+    expect(result?.status).toBe("failed");
+    expect(result?.errorMessage).toMatch(/declined/i);
 
     let state = initialState();
     state = transition(state, { type: "CALL_STARTED" });
     state = transition(state, { type: "RECOMMENDATION_READY" });
     state = transition(state, { type: "USER_CONFIRMED" });
-    state = transition(state, { type: "APPROVAL_DECLINED" });
-    expect(state.status).toBe("declined");
+    state = transition(state, { type: "FAIL", reason: result?.errorMessage ?? "" });
+    expect(state.status).toBe("failed");
   });
 
-  it("verbal decline at the recommended step lands on declined without an approval", async () => {
+  it("verbal decline at the recommended step lands on cancelled without a funding session", async () => {
     const { providers } = buildTestProviders();
     const [opp] = await providers.earn.listOpportunities();
     await providers.intentFactory.createIntent({
@@ -109,6 +115,6 @@ describe("happy-path orchestration with mocks", () => {
     state = transition(state, { type: "CALL_STARTED" });
     state = transition(state, { type: "RECOMMENDATION_READY" });
     state = transition(state, { type: "USER_DECLINED" });
-    expect(state.status).toBe("declined");
+    expect(state.status).toBe("cancelled");
   });
 });

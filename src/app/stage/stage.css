@@ -1,0 +1,142 @@
+/* ─── Stage (phone audience surface) ────────────────────────────────────── */
+/* Dedicated to /stage and /stage/[id]. Overrides the app's default gradient
+   background so the phone stays full-bleed without any laptop-facing chrome. */
+
+.stage-root {
+  position: fixed;
+  inset: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  background: #f7f7f5;
+  color: #0f1115;
+  padding: 1.5rem 1.25rem calc(2rem + env(safe-area-inset-bottom));
+  font-family: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+    sans-serif;
+  font-feature-settings: "cv11", "ss01";
+  -webkit-font-smoothing: antialiased;
+}
+
+.stage-shell {
+  max-width: 520px;
+  margin: 0 auto;
+  min-height: calc(100vh - 3.5rem);
+  min-height: calc(100dvh - 3.5rem);
+  display: flex;
+  flex-direction: column;
+}
+
+/* Motion-generated spring eases (same values the hackaton uses, verbatim). */
+.stage-root {
+  --ease-rise: linear(
+    0,
+    0.167,
+    0.5142,
+    0.8564,
+    1.0917,
+    1.1956,
+    1.1942,
+    1.1343,
+    1.0599,
+    1,
+    0.9664,
+    0.9579,
+    0.9659,
+    0.9808,
+    0.995,
+    1.0044,
+    1.0084,
+    1.008,
+    1.0054,
+    1.0023,
+    0.9998,
+    0.9985,
+    1,
+    0.9986,
+    0.9992,
+    0.9998,
+    1
+  );
+  --ease-snap: linear(
+    0,
+    0.3772,
+    0.8604,
+    1.0738,
+    1.0846,
+    1.0353,
+    1.0006,
+    0.991,
+    0.9941,
+    0.9985,
+    1.0006,
+    1
+  );
+  --ease-pop: linear(
+    0,
+    0.093,
+    0.3251,
+    0.6218,
+    0.9149,
+    1.1531,
+    1.3073,
+    1.37,
+    1.3519,
+    1.2756,
+    1.1685,
+    1.057,
+    0.962,
+    0.8964,
+    0.8649,
+    0.865,
+    0.889,
+    0.9271,
+    0.969,
+    1.0064,
+    1.0338,
+    1.0486,
+    1.0512,
+    1.0441,
+    1.0309,
+    1.0153,
+    1.0007,
+    0.9895,
+    0.9828,
+    0.9808,
+    0.9827,
+    0.9872,
+    0.9929,
+    0.9985,
+    1.003,
+    1.006,
+    1.0071,
+    1.0067,
+    1.0052,
+    1.0032,
+    1.001,
+    0.9992,
+    0.998,
+    1,
+    1,
+    0.9979,
+    0.9986,
+    0.9994,
+    1.0001,
+    1.0007,
+    1,
+    1
+  );
+}
+
+.stage-root[data-mood="warm"] {
+  background: linear-gradient(180deg, #0b0b10 0%, #141423 100%);
+  color: #f4f4f5;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .stage-root *,
+  .stage-root *::before,
+  .stage-root *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}

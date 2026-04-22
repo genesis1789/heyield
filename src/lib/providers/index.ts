@@ -5,7 +5,6 @@ import type {
   EarnAdapter,
   IntentFactoryAdapter,
   Providers,
-  RevolutAdapter,
 } from "./types";
 import { MockEarnAdapter } from "./earn/mock";
 import { LifiEarnAdapter } from "./earn/lifi";
@@ -14,15 +13,15 @@ import {
   PersistentMockIntentFactoryAdapter,
 } from "./intentFactory/mock";
 import { RealIntentFactoryAdapter } from "./intentFactory/real";
-import {
-  MockRevolutAdapter,
-  PersistentMockRevolutAdapter,
-  type MockRevolutConfigRef,
-} from "./revolut/mock";
-import { RealRevolutAdapter } from "./revolut/real";
 import { MockPricingAdapter } from "./pricing/mock";
 import { LifiPricingAdapter } from "./pricing/lifiQuote";
 import type { PricingAdapter } from "./pricing/types";
+import type { FundingAdapter } from "./funding/types";
+import {
+  SimulatorFundingAdapter,
+  type SimulatorConfig,
+} from "./funding/simulator";
+import { MerchantFundingAdapter } from "./funding/merchant";
 
 /**
  * Central real-vs-mock provider selection. API routes import ONLY from this
@@ -31,26 +30,62 @@ import type { PricingAdapter } from "./pricing/types";
  *   2. extending the env-var switch below,
  *   3. leaving every route untouched.
  *
- * State is cached on globalThis so Next.js dev-mode hot reloads don't blow away
- * in-memory mock data between requests.
+ * State is cached on globalThis so Next.js dev-mode hot reloads don't blow
+ * away in-memory mock data between requests.
  */
 
 type Glob = {
   __vc_providers?: Providers;
-  __vc_mockConfig?: MockRevolutConfigRef;
+  __vc_simulatorConfig?: SimulatorConfig;
 };
 const g = globalThis as unknown as Glob;
 
-export const mockConfig: MockRevolutConfigRef =
-  g.__vc_mockConfig ??
-  (g.__vc_mockConfig = {
+const DEFAULT_PROTOCOL_LABEL = "Aave v3";
+const DEFAULT_DEST_WALLET =
+  "0x4BC6D93bA0aFbfc3A8Aa22F9Cc1C8a1E9f3a7b81"; // cosmetic fallback for simulator mode
+
+function appBaseUrl(): string {
+  // Client-provided URL only: never leak private headers into it. Falls
+  // back to the conventional local dev origin.
+  return (
+    process.env.PUBLIC_BASE_URL ??
+    process.env.NEXT_PUBLIC_APP_BASE_URL ??
+    "http://localhost:3000"
+  );
+}
+
+function readNumber(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+function destWalletAddress(): string {
+  return (
+    process.env.FUNDING_DEST_WALLET?.trim() ??
+    process.env.REVOLUT_RAMP_DEST_WALLET?.trim() ??
+    DEFAULT_DEST_WALLET
+  );
+}
+
+export const simulatorConfig: SimulatorConfig =
+  g.__vc_simulatorConfig ??
+  (g.__vc_simulatorConfig = {
+    appBaseUrl: appBaseUrl(),
+    destWalletAddress: destWalletAddress(),
+    stepMs: readNumber("FUNDING_SIM_STEP_MS", 2200),
     forceFailure: false,
     skipDelays: false,
-    confirmAfterMs: 1500,
+    protocolLabel: DEFAULT_PROTOCOL_LABEL,
+    txExplorerUrlTemplate: "https://sepolia.etherscan.io/tx/{hash}",
+    storeFile: process.env.FUNDING_SIM_STORE_FILE,
   });
 
-export function setMockConfig(patch: Partial<MockRevolutConfigRef>): void {
-  Object.assign(mockConfig, patch);
+export function setSimulatorConfig(
+  patch: Partial<SimulatorConfig>,
+): void {
+  Object.assign(simulatorConfig, patch);
 }
 
 function pickEarn(): EarnAdapter {
@@ -65,16 +100,57 @@ function pickIntentFactory(): IntentFactoryAdapter {
   return new PersistentMockIntentFactoryAdapter();
 }
 
-function pickRevolut(): RevolutAdapter {
-  const choice = (process.env.REVOLUT_PROVIDER ?? "mock").toLowerCase();
-  if (choice === "real") return new RealRevolutAdapter(process.env.REVOLUT_API_KEY ?? "");
-  return new PersistentMockRevolutAdapter(mockConfig);
-}
-
 function pickPricing(): PricingAdapter {
   const choice = (process.env.PRICING_PROVIDER ?? "lifi").toLowerCase();
   if (choice === "mock") return new MockPricingAdapter();
   return new LifiPricingAdapter(process.env.LIFI_API_KEY);
+}
+
+function pickFunding(): FundingAdapter {
+  const choice = (process.env.FUNDING_PROVIDER ?? "simulator").toLowerCase();
+  if (choice === "merchant" || choice === "merchant-onchain") {
+    const secret = process.env.REVOLUT_MERCHANT_SECRET_KEY;
+    if (!secret) {
+      console.warn(
+        "[providers] FUNDING_PROVIDER=%s but REVOLUT_MERCHANT_SECRET_KEY is unset — falling back to simulator.",
+        choice,
+      );
+      return new SimulatorFundingAdapter(simulatorConfig);
+    }
+    const onchain =
+      choice === "merchant-onchain" &&
+      process.env.SEPOLIA_SOURCE_PRIVATE_KEY &&
+      /^0x[a-fA-F0-9]{64}$/.test(process.env.SEPOLIA_SOURCE_PRIVATE_KEY)
+        ? {
+            sourcePrivateKey: process.env
+              .SEPOLIA_SOURCE_PRIVATE_KEY as `0x${string}`,
+            rpcUrl:
+              process.env.SEPOLIA_RPC_URL ??
+              "https://ethereum-sepolia-rpc.publicnode.com",
+            onchainAmountEurc: readNumber("DEMO_ONCHAIN_AMOUNT_EURC", 0.1),
+            txExplorerUrlTemplate:
+              simulatorConfig.txExplorerUrlTemplate,
+          }
+        : undefined;
+    if (choice === "merchant-onchain" && !onchain) {
+      console.warn(
+        "[providers] FUNDING_PROVIDER=merchant-onchain but SEPOLIA_SOURCE_PRIVATE_KEY is missing/invalid — running fiat-only.",
+      );
+    }
+    return new MerchantFundingAdapter({
+      merchantSecretKey: secret,
+      merchantBaseUrl:
+        process.env.REVOLUT_MERCHANT_BASE_URL ??
+        "https://sandbox-merchant.revolut.com/api",
+      merchantApiVersion:
+        process.env.REVOLUT_MERCHANT_API_VERSION ?? "2024-09-01",
+      publicBaseUrl: process.env.PUBLIC_BASE_URL,
+      protocolLabel: DEFAULT_PROTOCOL_LABEL,
+      destWalletAddress: destWalletAddress(),
+      onchain,
+    });
+  }
+  return new SimulatorFundingAdapter(simulatorConfig);
 }
 
 export function getProviders(): Providers {
@@ -82,7 +158,7 @@ export function getProviders(): Providers {
   const providers: Providers = {
     earn: pickEarn(),
     intentFactory: pickIntentFactory(),
-    revolut: pickRevolut(),
+    funding: pickFunding(),
     pricing: pickPricing(),
   };
   g.__vc_providers = providers;
@@ -90,23 +166,34 @@ export function getProviders(): Providers {
 }
 
 /** Test-only: build a fresh, un-cached provider bundle with a private config. */
-export function buildTestProviders(config?: Partial<MockRevolutConfigRef>): {
+export function buildTestProviders(
+  overrides: Partial<SimulatorConfig> = {},
+): {
   providers: Providers;
-  mockConfig: MockRevolutConfigRef;
+  simulatorConfig: SimulatorConfig;
 } {
-  const cfg: MockRevolutConfigRef = {
+  const cfg: SimulatorConfig = {
+    appBaseUrl: "http://localhost:3000",
+    destWalletAddress: DEFAULT_DEST_WALLET,
+    stepMs: 0,
     forceFailure: false,
     skipDelays: true,
-    confirmAfterMs: 0,
-    ...config,
+    protocolLabel: DEFAULT_PROTOCOL_LABEL,
+    txExplorerUrlTemplate: "https://sepolia.etherscan.io/tx/{hash}",
+    // Each test bundle gets its own file so parallel vitest workers don't
+    // clobber each other's state.
+    storeFile: `funding-sessions.test-${process.pid}-${Math.random()
+      .toString(36)
+      .slice(2, 8)}.json`,
+    ...overrides,
   };
   return {
     providers: {
       earn: new MockEarnAdapter(),
       intentFactory: new MockIntentFactoryAdapter(),
-      revolut: new MockRevolutAdapter(cfg),
+      funding: new SimulatorFundingAdapter(cfg),
       pricing: new MockPricingAdapter(),
     },
-    mockConfig: cfg,
+    simulatorConfig: cfg,
   };
 }

@@ -1,16 +1,28 @@
 import { NextResponse } from "next/server";
-import { mockConfig, setMockConfig } from "@/lib/providers";
+import { setSimulatorConfig, simulatorConfig } from "@/lib/providers";
 
 export async function GET() {
-  return NextResponse.json({ mockConfig });
+  return NextResponse.json({
+    simulatorConfig: {
+      forceFailure: simulatorConfig.forceFailure,
+      skipDelays: simulatorConfig.skipDelays,
+      stepMs: simulatorConfig.stepMs,
+    },
+  });
 }
 
 export async function POST(req: Request) {
   const body = (await req.json().catch(() => ({}))) as {
     forceFailure?: boolean;
     skipDelays?: boolean;
-    confirmAfterMs?: number;
+    stepMs?: number;
   };
-  setMockConfig(body);
-  return NextResponse.json({ mockConfig });
+  setSimulatorConfig(body);
+  return NextResponse.json({
+    simulatorConfig: {
+      forceFailure: simulatorConfig.forceFailure,
+      skipDelays: simulatorConfig.skipDelays,
+      stepMs: simulatorConfig.stepMs,
+    },
+  });
 }

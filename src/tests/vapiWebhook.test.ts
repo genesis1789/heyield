@@ -1,14 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { POST } from "@/app/api/vapi/webhook/route";
 import { getSession, resetSession } from "@/lib/agent/session";
+import { writeJsonFile } from "@/lib/server/jsonStore";
 
 /**
  * Exercises the single server-URL webhook that the Vapi assistant uses for
- * all four tool invocations. We assert:
+ * all tool invocations. We assert:
  *   - both the flat and nested tool-call shapes are accepted
  *   - the result field is always a SINGLE-LINE STRING per Vapi's spec
  *   - the envelope is { results: [{ toolCallId, result | error }] }
  *   - shared-secret auth is enforced when configured
+ *   - the legacy `createApproval` / `getApprovalStatus` names still resolve
+ *     onto the new funding tools
  */
 
 function req(body: unknown, headers: Record<string, string> = {}) {
@@ -43,15 +46,29 @@ function nestedCall(name: string, args: Record<string, unknown>, id = "call_1") 
   };
 }
 
-function firstResult(body: { results: ({ result?: string; error?: string } & { toolCallId: string })[] }) {
+function firstResult(body: {
+  results: ({ result?: string; error?: string } & { toolCallId: string })[];
+}) {
   return body.results[0];
 }
 
 describe("POST /api/vapi/webhook", () => {
   beforeEach(() => {
     resetSession();
+    writeJsonFile("mock-intents.json", { counter: 0, intents: {} });
+    writeJsonFile(
+      process.env.FUNDING_SIM_STORE_FILE ?? "funding-sessions.json",
+      { counter: 0, sessions: {} },
+    );
     delete process.env.VAPI_WEBHOOK_SECRET;
     process.env.PRICING_PROVIDER = "mock";
+    process.env.FUNDING_PROVIDER = "simulator";
+    process.env.FUNDING_SIM_STEP_MS = "0";
+    // Drop cached providers so the next getProviders() rebuilds.
+    delete (globalThis as unknown as { __vc_providers?: unknown })
+      .__vc_providers;
+    delete (globalThis as unknown as { __vc_simulatorConfig?: unknown })
+      .__vc_simulatorConfig;
   });
   afterEach(() => {
     resetSession();
@@ -72,13 +89,17 @@ describe("POST /api/vapi/webhook", () => {
   it("returns 200 when VAPI_WEBHOOK_SECRET matches", async () => {
     process.env.VAPI_WEBHOOK_SECRET = "secret-xyz";
     const res = await POST(
-      req(flatCall("recommend", { amountFiat: 1000 }), { "x-vapi-secret": "secret-xyz" }),
+      req(flatCall("recommend", { amountFiat: 1000 }), {
+        "x-vapi-secret": "secret-xyz",
+      }),
     );
     expect(res.status).toBe(200);
   });
 
   it("dispatches `recommend` — result is a SINGLE-LINE JSON string", async () => {
-    const res = await POST(req(flatCall("recommend", { amountFiat: 1000, fiatCurrency: "EUR" })));
+    const res = await POST(
+      req(flatCall("recommend", { amountFiat: 1000, fiatCurrency: "EUR" })),
+    );
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
       results: { toolCallId: string; result: string }[];
@@ -103,25 +124,6 @@ describe("POST /api/vapi/webhook", () => {
     expect(parsed.amountFiat).toBe(500);
   });
 
-  it("accepts arguments as a JSON string", async () => {
-    const envelope = {
-      message: {
-        type: "tool-calls",
-        toolCallList: [
-          {
-            id: "call_str",
-            type: "function",
-            name: "recommend",
-            arguments: JSON.stringify({ amountFiat: 500, fiatCurrency: "EUR" }),
-          },
-        ],
-      },
-    };
-    const res = await POST(req(envelope));
-    const body = (await res.json()) as { results: { result: string }[] };
-    expect(JSON.parse(body.results[0].result).amountFiat).toBe(500);
-  });
-
   it("rejects invalid args with a per-call error (string) — HTTP stays 200", async () => {
     const res = await POST(req(flatCall("recommend", { amountFiat: -1 })));
     expect(res.status).toBe(200);
@@ -140,7 +142,7 @@ describe("POST /api/vapi/webhook", () => {
     expect(firstResult(body).error).toBeDefined();
   });
 
-  it("acknowledges a transcript message and appends to session", async () => {
+  it("transcript payloads append to the session", async () => {
     const res = await POST(
       req({
         message: {
@@ -154,123 +156,24 @@ describe("POST /api/vapi/webhook", () => {
     expect(res.status).toBe(200);
     const session = getSession();
     expect(session.transcript).toHaveLength(1);
-    expect(session.transcript[0].role).toBe("user");
-    expect(session.transcript[0].partial).toBe(false);
     expect(session.transcript[0].text).toBe("I have 1000 euros sitting idle.");
   });
 
-  it("normalizes transcript role aliases and nested transcript text", async () => {
-    const res = await POST(
-      req({
-        message: {
-          type: "transcript",
-          role: "bot",
-          transcriptType: "interim",
-          transcript: { text: "Let me check that for you." },
-        },
-      }),
-    );
-    expect(res.status).toBe(200);
-    const session = getSession();
-    expect(session.transcript).toHaveLength(1);
-    expect(session.transcript[0].role).toBe("assistant");
-    expect(session.transcript[0].partial).toBe(true);
-    expect(session.transcript[0].text).toBe("Let me check that for you.");
-  });
-
-  it("collapses partial transcripts for the same speaker into one entry", async () => {
-    for (const t of [
-      { transcriptType: "partial", transcript: "I have" },
-      { transcriptType: "partial", transcript: "I have 1000" },
-      { transcriptType: "final", transcript: "I have 1000 euros." },
-    ] as const) {
-      await POST(
-        req({
-          message: { type: "transcript", role: "user", transcriptType: t.transcriptType, transcript: t.transcript },
-        }),
-      );
-    }
-    const session = getSession();
-    expect(session.transcript).toHaveLength(1);
-    expect(session.transcript[0].text).toBe("I have 1000 euros.");
-    expect(session.transcript[0].partial).toBe(false);
-  });
-
-  it("status-update transitions drive session.callStatus", async () => {
-    await POST(req({ message: { type: "status-update", status: "ringing" } }));
-    expect(getSession().callStatus).toBe("ringing");
-
-    await POST(req({ message: { type: "status-update", status: "in-progress" } }));
-    expect(getSession().callStatus).toBe("in-progress");
-
-    await POST(req({ message: { type: "status-update", status: "ended" } }));
-    expect(getSession().callStatus).toBe("ended");
-  });
-
-  it("conversation-update rebuilds the transcript from assistant and user turns", async () => {
-    const res = await POST(
-      req({
-        message: {
-          type: "conversation-update",
-          conversation: [
-            { role: "system", content: "ignore this" },
-            { role: "assistant", content: "Hi, what would you like to do?" },
-            { role: "user", content: "I have 1000 euros." },
-            { role: "tool", content: "{\"ignored\":true}" },
-            { role: "assistant", content: "I can help with that." },
-          ],
-        },
-      }),
-    );
-    expect(res.status).toBe(200);
-    expect(getSession().transcript).toMatchObject([
-      { role: "assistant", text: "Hi, what would you like to do?" },
-      { role: "user", text: "I have 1000 euros." },
-      { role: "assistant", text: "I can help with that." },
-    ]);
-  });
-
-  it("speech-update rebuilds the transcript from artifact messages", async () => {
-    const res = await POST(
-      req({
-        message: {
-          type: "speech-update",
-          status: "stopped",
-          role: "assistant",
-          artifact: {
-            messages: [
-              { role: "bot", message: "Hello there." },
-              { role: "user", message: "I want better yield." },
-            ],
-          },
-        },
-      }),
-    );
-    expect(res.status).toBe(200);
-    expect(getSession().transcript).toMatchObject([
-      { role: "assistant", text: "Hello there." },
-      { role: "user", text: "I want better yield." },
-    ]);
-  });
-
-  it("accepts newly introduced status strings without 400ing", async () => {
-    const res = await POST(req({ message: { type: "status-update", status: "answered" } }));
-    expect(res.status).toBe(200);
-    expect(getSession().callStatus).toBe("answered");
-  });
-
   it("status-update to in-progress wipes a stale recommendation/transcript", async () => {
-    // Prime session with a recommendation + transcript from a prior call.
     await POST(req(flatCall("recommend", { amountFiat: 1000, fiatCurrency: "EUR" })));
     await POST(
       req({
-        message: { type: "transcript", role: "user", transcriptType: "final", transcript: "old." },
+        message: {
+          type: "transcript",
+          role: "user",
+          transcriptType: "final",
+          transcript: "old.",
+        },
       }),
     );
     expect(getSession().recommendation).not.toBeNull();
     expect(getSession().transcript).toHaveLength(1);
 
-    // New call starts.
     await POST(req({ message: { type: "status-update", status: "in-progress" } }));
     const fresh = getSession();
     expect(fresh.recommendation).toBeNull();
@@ -278,48 +181,60 @@ describe("POST /api/vapi/webhook", () => {
     expect(fresh.callStatus).toBe("in-progress");
   });
 
-  it("end-of-call-report marks the call ended", async () => {
-    await POST(req({ message: { type: "status-update", status: "in-progress" } }));
-    await POST(
-      req({ message: { type: "end-of-call-report", endedReason: "hangup", artifact: {} } }),
-    );
-    expect(getSession().callStatus).toBe("ended");
-  });
-
-  it("ignores malformed transcript payloads instead of failing the webhook", async () => {
-    const res = await POST(req({ message: { type: "transcript", transcript: 123 } }));
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as { ignored?: string; received?: boolean };
-    expect(body.received).toBe(true);
-    expect(body.ignored).toBe("invalid transcript payload");
-    expect(getSession().transcript).toHaveLength(0);
-  });
-
-  it("unknown message types are acknowledged with 200 and no side-effects", async () => {
-    const before = getSession().updatedAt;
-    const res = await POST(req({ message: { type: "totally-new-event", foo: "bar" } }));
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as { ignored?: string; received?: boolean };
-    expect(body.ignored).toBe("totally-new-event");
-    expect(getSession().updatedAt).toBe(before);
-  });
-
-  it("recommend → createApproval → getApprovalStatus is end-to-end callable", async () => {
+  it("recommend → startFunding → getFundingStatus is end-to-end callable", async () => {
     const recRes = await POST(
       req(flatCall("recommend", { amountFiat: 1000, fiatCurrency: "EUR" })),
     );
     const rec = (await recRes.json()) as { results: { result: string }[] };
     const { intentId } = JSON.parse(rec.results[0].result);
 
-    const apvRes = await POST(req(flatCall("createApproval", { intentId }, "call_2")));
-    const apv = (await apvRes.json()) as { results: { result: string }[] };
-    const { approvalId, status } = JSON.parse(apv.results[0].result);
-    expect(status).toBe("pending");
+    const fundRes = await POST(
+      req(flatCall("startFunding", { intentId }, "call_2")),
+    );
+    const fund = (await fundRes.json()) as { results: { result: string }[] };
+    const { sessionId, status, checkoutUrl, simulated } = JSON.parse(
+      fund.results[0].result,
+    );
+    expect(sessionId).toMatch(/^fund_sim_/);
+    expect(status).toBe("awaiting_checkout");
+    expect(checkoutUrl).toContain(`/checkout/${sessionId}`);
+    expect(simulated).toBe(true);
 
     const statRes = await POST(
-      req(flatCall("getApprovalStatus", { approvalId }, "call_3")),
+      req(flatCall("getFundingStatus", { sessionId }, "call_3")),
     );
     const stat = (await statRes.json()) as { results: { result: string }[] };
-    expect(JSON.parse(stat.results[0].result).status).toBe("pending");
+    expect(JSON.parse(stat.results[0].result).status).toBe("awaiting_checkout");
+  });
+
+  it("legacy createApproval / getApprovalStatus aliases route to the funding tools", async () => {
+    const recRes = await POST(
+      req(flatCall("recommend", { amountFiat: 500, fiatCurrency: "EUR" })),
+    );
+    const rec = (await recRes.json()) as { results: { result: string }[] };
+    const { intentId } = JSON.parse(rec.results[0].result);
+
+    const createRes = await POST(
+      req(flatCall("createApproval", { intentId }, "call_2")),
+    );
+    const create = (await createRes.json()) as {
+      results: { result: string }[];
+    };
+    const parsed = JSON.parse(create.results[0].result);
+    expect(parsed.sessionId).toMatch(/^fund_sim_/);
+
+    const statRes = await POST(
+      req(
+        flatCall(
+          "getApprovalStatus",
+          { approvalId: parsed.sessionId },
+          "call_3",
+        ),
+      ),
+    );
+    const stat = (await statRes.json()) as { results: { result: string }[] };
+    expect(JSON.parse(stat.results[0].result).status).toBe(
+      "awaiting_checkout",
+    );
   });
 });

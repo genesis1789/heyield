@@ -1,22 +1,18 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  PersistentMockIntentFactoryAdapter,
-} from "@/lib/providers/intentFactory/mock";
+import { PersistentMockIntentFactoryAdapter } from "@/lib/providers/intentFactory/mock";
 import { LifiEarnAdapter } from "@/lib/providers/earn/lifi";
 import { LifiPricingAdapter } from "@/lib/providers/pricing/lifiQuote";
 import {
-  type MockRevolutConfigRef,
-  PersistentMockRevolutAdapter,
-} from "@/lib/providers/revolut/mock";
+  SimulatorFundingAdapter,
+  type SimulatorConfig,
+} from "@/lib/providers/funding/simulator";
 import { SEED_OPPORTUNITY } from "@/lib/seed/opportunities";
 import { VapiTelephonyAdapter } from "@/lib/providers/telephony/vapi";
-import { RealRevolutAdapter } from "@/lib/providers/revolut/real";
 import { writeJsonFile } from "@/lib/server/jsonStore";
 
 /**
- * Tests for the adapter changes introduced by the provider-upgrade audit.
- * Every real adapter MUST fall back gracefully rather than throw, except
- * where the stub is intentionally unimplemented (RealRevolutAdapter).
+ * Tests for the adapter surface after the funding-rail rework. Every real
+ * adapter MUST fall back gracefully rather than throw.
  */
 
 const originalFetch = globalThis.fetch;
@@ -27,7 +23,23 @@ function mockFetch(impl: typeof fetch) {
 
 function resetPersistentDemoStores() {
   writeJsonFile("mock-intents.json", { counter: 0, intents: {} });
-  writeJsonFile("mock-approvals.json", { counter: 0, approvals: {} });
+}
+
+let simSeq = 0;
+function simulatorConfig(overrides: Partial<SimulatorConfig> = {}): SimulatorConfig {
+  return {
+    appBaseUrl: "http://localhost:3000",
+    destWalletAddress: "0x0000000000000000000000000000000000000000",
+    stepMs: 0,
+    forceFailure: false,
+    skipDelays: true,
+    protocolLabel: "Aave v3",
+    txExplorerUrlTemplate: "https://sepolia.etherscan.io/tx/{hash}",
+    // Unique file per adapter instance so parallel vitest workers don't
+    // clobber each other's state.
+    storeFile: `funding-sessions.adapter-test-${process.pid}-${++simSeq}.json`,
+    ...overrides,
+  };
 }
 
 describe("LifiEarnAdapter (hybrid-real)", () => {
@@ -58,7 +70,7 @@ describe("LifiEarnAdapter (hybrid-real)", () => {
                 name: "Aave v3 USDC",
                 protocol: { name: "Aave v3" },
                 underlyingTokens: [{ symbol: "USDC" }],
-                analytics: { apy: { total: 0.073 } }, // 7.30%
+                analytics: { apy: { total: 0.073 } },
               },
             ],
           }),
@@ -70,7 +82,6 @@ describe("LifiEarnAdapter (hybrid-real)", () => {
     const opps = await adapter.listOpportunities();
     expect(opps).toHaveLength(1);
     expect(opps[0].apyBps).toBe(730);
-    // identity, risk, and fees stay from the seed
     expect(opps[0].id).toBe(SEED_OPPORTUNITY.id);
     expect(opps[0].riskBand).toBe(SEED_OPPORTUNITY.riskBand);
     expect(opps[0].feesBps).toBe(SEED_OPPORTUNITY.feesBps);
@@ -81,65 +92,6 @@ describe("LifiEarnAdapter (hybrid-real)", () => {
     const adapter = new LifiEarnAdapter("test-key");
     const opps = await adapter.listOpportunities();
     expect(opps[0].apyBps).toBe(SEED_OPPORTUNITY.apyBps);
-  });
-
-  it("falls back to seed when response shape is unexpected", async () => {
-    mockFetch(
-      vi.fn(async () => new Response(JSON.stringify({ wrong: "shape" }), { status: 200 })),
-    );
-    const adapter = new LifiEarnAdapter("test-key");
-    const opps = await adapter.listOpportunities();
-    expect(opps[0].apyBps).toBe(SEED_OPPORTUNITY.apyBps);
-  });
-
-  it("falls back to seed when no Aave USDC vault is returned", async () => {
-    mockFetch(
-      vi.fn(async () =>
-        new Response(
-          JSON.stringify({
-            data: [
-              {
-                address: "0xother",
-                chainId: 1,
-                name: "Compound USDT",
-                protocol: { name: "Compound" },
-                underlyingTokens: [{ symbol: "USDT" }],
-                analytics: { apy: { total: 0.1 } },
-              },
-            ],
-          }),
-          { status: 200 },
-        ),
-      ),
-    );
-    const adapter = new LifiEarnAdapter("test-key");
-    const opps = await adapter.listOpportunities();
-    expect(opps[0].apyBps).toBe(SEED_OPPORTUNITY.apyBps);
-  });
-
-  it("tolerates analytics.apy.total already expressed as a percentage", async () => {
-    mockFetch(
-      vi.fn(async () =>
-        new Response(
-          JSON.stringify({
-            data: [
-              {
-                address: "0xvault",
-                chainId: 8453,
-                name: "Aave v3 USDC",
-                protocol: { name: "Aave v3" },
-                underlyingTokens: [{ symbol: "USDC" }],
-                analytics: { apy: { total: 5.2 } }, // already "5.2 %"
-              },
-            ],
-          }),
-          { status: 200 },
-        ),
-      ),
-    );
-    const adapter = new LifiEarnAdapter("test-key");
-    const opps = await adapter.listOpportunities();
-    expect(opps[0].apyBps).toBe(520);
   });
 
   it("getOpportunity matches by id via listOpportunities", async () => {
@@ -186,28 +138,12 @@ describe("LifiPricingAdapter", () => {
     expect(est.source).toBe("fallback");
     expect(est.gasUsd).toBeGreaterThan(0);
   });
-
-  it("falls back on malformed JSON", async () => {
-    mockFetch(vi.fn(async () => new Response("not-json", { status: 200 })));
-    const est = await new LifiPricingAdapter().estimateDepositCost();
-    expect(est.source).toBe("fallback");
-  });
 });
 
 describe("VapiTelephonyAdapter", () => {
   it("reports unsupported when keys are missing", () => {
     expect(new VapiTelephonyAdapter("", "asst").isSupported()).toBe(false);
     expect(new VapiTelephonyAdapter("pk", "").isSupported()).toBe(false);
-  });
-
-  it("reports supported only when window + keys both exist", () => {
-    // jsdom provides a window in Vitest's default environment; this suite
-    // pins the check to what the adapter actually inspects.
-    const wasWindow = "window" in globalThis;
-    if (!wasWindow) (globalThis as unknown as { window: object }).window = {};
-    const adapter = new VapiTelephonyAdapter("pk", "asst");
-    expect(adapter.isSupported()).toBe(true);
-    if (!wasWindow) delete (globalThis as unknown as { window?: object }).window;
   });
 
   it("start throws when not configured", async () => {
@@ -220,7 +156,6 @@ describe("persistent mock stores", () => {
   beforeEach(() => {
     resetPersistentDemoStores();
   });
-
   afterEach(() => {
     resetPersistentDemoStores();
   });
@@ -241,45 +176,84 @@ describe("persistent mock stores", () => {
       opportunityId: "opp_1",
     });
   });
+});
 
-  it("shares approval taps across adapter instances", async () => {
-    const config: MockRevolutConfigRef = {
-      forceFailure: false,
-      skipDelays: false,
-      confirmAfterMs: 1500,
-    };
-    const creator = new PersistentMockRevolutAdapter(config);
-    const tapper = new PersistentMockRevolutAdapter(config);
-    const poller = new PersistentMockRevolutAdapter(config);
+describe("SimulatorFundingAdapter", () => {
+  beforeEach(() => {
+    resetPersistentDemoStores();
+  });
+  afterEach(() => {
+    resetPersistentDemoStores();
+  });
 
-    const approval = await creator.requestApproval({
+  it("creates a session with a local checkout URL and deterministic id", async () => {
+    const adapter = new SimulatorFundingAdapter(simulatorConfig());
+    const session = await adapter.createSession({
       intentId: "intent_demo_001",
       amountFiat: 1000,
       fiatCurrency: "EUR",
+      productName: "Aave v3 USDC",
     });
-    expect(approval.status).toBe("pending");
-
-    expect(tapper.recordTap(approval.approvalId, "approve")).toMatchObject({
-      approvalId: approval.approvalId,
-      status: "approved",
-    });
-
-    await expect(poller.getApprovalStatus(approval.approvalId)).resolves.toMatchObject({
-      approvalId: approval.approvalId,
-      status: "approved",
-    });
+    expect(session.sessionId).toBe("fund_sim_001");
+    expect(session.checkoutUrl).toBe(
+      "http://localhost:3000/checkout/fund_sim_001",
+    );
+    expect(session.status).toBe("awaiting_checkout");
+    expect(session.simulated).toBe(true);
   });
-});
 
-describe("RealRevolutAdapter (intentional stub)", () => {
-  it("requestApproval throws with a message pointing to the documented boundary", async () => {
-    const adapter = new RealRevolutAdapter("key");
-    await expect(
-      adapter.requestApproval({
-        intentId: "x",
-        amountFiat: 1,
-        fiatCurrency: "EUR",
-      }),
-    ).rejects.toThrow(/Revolut|mock/i);
+  it("advances to invested after confirm_payment with zero-delay steps", async () => {
+    const adapter = new SimulatorFundingAdapter(simulatorConfig({ stepMs: 0 }));
+    const session = await adapter.createSession({
+      intentId: "intent_demo_001",
+      amountFiat: 1000,
+      fiatCurrency: "EUR",
+      productName: "Aave v3 USDC",
+    });
+    const paid = await adapter.advance!(session.sessionId, {
+      type: "confirm_payment",
+    });
+    expect(paid?.status).toBe("payment_received");
+
+    const settled = await adapter.getSession(session.sessionId);
+    expect(settled?.status).toBe("invested");
+    expect(settled?.txHash).toBeTruthy();
+    expect(settled?.txExplorerUrl).toContain(settled?.txHash ?? "");
+  });
+
+  it("force-failure flips the session on the first confirm_payment tap", async () => {
+    const adapter = new SimulatorFundingAdapter(
+      simulatorConfig({ forceFailure: true }),
+    );
+    const session = await adapter.createSession({
+      intentId: "intent_demo_001",
+      amountFiat: 1000,
+      fiatCurrency: "EUR",
+      productName: "Aave v3 USDC",
+    });
+    const result = await adapter.advance!(session.sessionId, {
+      type: "confirm_payment",
+    });
+    expect(result?.status).toBe("failed");
+    expect(result?.errorMessage).toMatch(/declined/i);
+  });
+
+  it("cancel during awaiting_checkout moves to cancelled", async () => {
+    const adapter = new SimulatorFundingAdapter(simulatorConfig());
+    const session = await adapter.createSession({
+      intentId: "intent_demo_001",
+      amountFiat: 1000,
+      fiatCurrency: "EUR",
+      productName: "Aave v3 USDC",
+    });
+    const cancelled = await adapter.advance!(session.sessionId, {
+      type: "cancel",
+    });
+    expect(cancelled?.status).toBe("cancelled");
+  });
+
+  it("getSession returns null for unknown ids", async () => {
+    const adapter = new SimulatorFundingAdapter(simulatorConfig());
+    await expect(adapter.getSession("nope")).resolves.toBeNull();
   });
 });

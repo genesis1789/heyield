@@ -7,10 +7,13 @@
  *   idle
  *    └─ CALL_STARTED → call_active
  *         ├─ RECOMMENDATION_READY → recommended
- *         │    ├─ USER_DECLINED    → declined (terminal)
- *         │    └─ USER_CONFIRMED   → approval_pending
- *         │         ├─ APPROVAL_APPROVED → completed (terminal)
- *         │         └─ APPROVAL_DECLINED → declined (terminal)
+ *         │    ├─ USER_DECLINED        → cancelled (terminal)
+ *         │    └─ USER_CONFIRMED       → awaiting_checkout
+ *         │         ├─ PAYMENT_RECEIVED → payment_received
+ *         │         │    └─ CRYPTO_IN_FLIGHT → routing_to_yield
+ *         │         │         └─ INVESTED  → invested (terminal)
+ *         │         ├─ CANCELLED        → cancelled (terminal)
+ *         │         └─ FAIL             → failed   (terminal)
  *         └─ FAIL → failed (terminal)
  *    └─ RESET → idle
  */
@@ -18,19 +21,25 @@ export const DEMO_STATUSES = [
   "idle",
   "call_active",
   "recommended",
-  "approval_pending",
-  "completed",
-  "declined",
+  "awaiting_checkout",
+  "payment_received",
+  "routing_to_yield",
+  "invested",
+  "cancelled",
   "failed",
 ] as const;
 
 export type DemoStatus = (typeof DEMO_STATUSES)[number];
 
-/** Three-step timeline shown once a recommendation has been made. */
+/**
+ * Four-step investment timeline shown once the user has confirmed.
+ * Mirrors the Aave-style narrative borrowed from the hackaton ramp flow.
+ */
 export const TIMELINE_STATUSES = [
-  "recommended",
-  "approval_pending",
-  "completed",
+  "awaiting_checkout",
+  "payment_received",
+  "routing_to_yield",
+  "invested",
 ] as const satisfies readonly DemoStatus[];
 export type TimelineStatus = (typeof TIMELINE_STATUSES)[number];
 
@@ -39,8 +48,10 @@ export type DemoEvent =
   | { type: "RECOMMENDATION_READY" }
   | { type: "USER_CONFIRMED" }
   | { type: "USER_DECLINED" }
-  | { type: "APPROVAL_APPROVED" }
-  | { type: "APPROVAL_DECLINED" }
+  | { type: "PAYMENT_RECEIVED" }
+  | { type: "CRYPTO_IN_FLIGHT" }
+  | { type: "INVESTED" }
+  | { type: "CANCELLED" }
   | { type: "FAIL"; reason: string }
   | { type: "RESET" };
 

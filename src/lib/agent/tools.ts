@@ -1,15 +1,25 @@
 import { getProviders } from "@/lib/providers";
 import { buildExplanation, selectOpportunity } from "@/lib/recommendation";
-import type { ApprovalStatus } from "@/lib/providers/types";
-import { setApproval, setRecommendation } from "./session";
+import type {
+  FundingProviderKind,
+  FundingStatus,
+} from "@/lib/providers/funding/types";
+import { setFunding, setRecommendation } from "./session";
 
 /**
  * Agent-facing tool handlers.
  *
- * These are the four operations the Vapi assistant can invoke mid-conversation
+ * These are the operations the Vapi assistant can invoke mid-conversation
  * via our /api/vapi/webhook endpoint. Each handler is a pure async function
  * that takes already-validated arguments and hits the central provider
- * factory — so UI, webhook, and tests all share the same code path.
+ * factory — so UI, webhook, and tests share the same code path.
+ *
+ * After the voice brief was reframed ("talk to your money, watch it invest"),
+ * the Revolut step is a FUNDING RAIL not an approval channel:
+ *   recommend            – pick + explain the product
+ *   startFunding         – create a Revolut checkout session
+ *   getFundingStatus     – poll lifecycle until the money is invested
+ *   endCall              – hang up
  */
 
 export interface RecommendOutput {
@@ -73,57 +83,119 @@ export async function recommend(args: {
   return output;
 }
 
-export interface CreateApprovalOutput {
-  approvalId: string;
-  intentId: string;
-  status: ApprovalStatus;
+export interface StartFundingOutput {
+  sessionId: string;
+  /** URL the agent tells the caller to open; also surfaced on the dashboard. */
+  checkoutUrl: string;
+  status: FundingStatus;
+  mode: FundingProviderKind;
+  simulated: boolean;
 }
 
-export async function createApproval(args: {
+export async function startFunding(args: {
   intentId: string;
   amountFiat?: number;
   fiatCurrency?: "EUR" | "USD";
-}): Promise<CreateApprovalOutput> {
-  const { intentFactory, revolut } = getProviders();
+}): Promise<StartFundingOutput> {
+  const { intentFactory, funding } = getProviders();
   const intent = await intentFactory.getIntent(args.intentId);
   if (!intent) throw new Error(`Intent not found: ${args.intentId}`);
 
-  const result = await revolut.requestApproval({
+  // Resolve the real fiat amount the caller confirmed. We keep the
+  // recommendation as the source of truth; intent.expectedUsdcAmount is
+  // the USDC equivalent and would misstate fiat on the card.
+  const amountFiat = args.amountFiat ?? intent.expectedUsdcAmount;
+  const fiatCurrency = args.fiatCurrency ?? "EUR";
+
+  // Product name for the checkout description. We pull it from the
+  // earn adapter so it stays in sync with the recommendation card.
+  const { earn } = getProviders();
+  const opp = await earn.getOpportunity(intent.opportunityId);
+  const productName = opp?.name ?? "Earn product";
+
+  const session = await funding.createSession({
     intentId: intent.id,
-    amountFiat: args.amountFiat ?? intent.expectedUsdcAmount,
-    fiatCurrency: args.fiatCurrency ?? "EUR",
+    amountFiat,
+    fiatCurrency,
+    productName,
   });
 
-  const output: CreateApprovalOutput = {
-    approvalId: result.approvalId,
-    intentId: result.intentId,
-    status: result.status,
+  setFunding({
+    sessionId: session.sessionId,
+    intentId: session.intentId,
+    status: session.status,
+    mode: session.mode,
+    simulated: session.simulated,
+    checkoutUrl: session.checkoutUrl,
+    amountFiat: session.amountFiat,
+    fiatCurrency: session.fiatCurrency,
+    productName: session.productName,
+    protocolLabel: session.protocolLabel,
+    destWalletAddress: session.destWalletAddress,
+    txHash: session.txHash,
+    txExplorerUrl: session.txExplorerUrl,
+    errorMessage: session.errorMessage,
+  });
+
+  return {
+    sessionId: session.sessionId,
+    checkoutUrl: session.checkoutUrl,
+    status: session.status,
+    mode: session.mode,
+    simulated: session.simulated,
   };
-  setApproval(output);
-  return output;
 }
 
-export interface GetApprovalStatusOutput {
-  approvalId: string;
-  status: ApprovalStatus;
+export interface GetFundingStatusOutput {
+  sessionId: string;
+  status: FundingStatus;
+  mode: FundingProviderKind;
+  simulated: boolean;
+  checkoutUrl?: string;
+  txHash?: string;
+  txExplorerUrl?: string;
   errorMessage?: string;
 }
 
-export async function getApprovalStatus(args: {
-  approvalId: string;
-}): Promise<GetApprovalStatusOutput> {
-  const { revolut } = getProviders();
-  const res = await revolut.getApprovalStatus(args.approvalId);
-  setApproval({
-    approvalId: res.approvalId,
-    intentId: res.intentId,
-    status: res.status,
-    errorMessage: res.errorMessage,
+export async function getFundingStatus(args: {
+  sessionId: string;
+}): Promise<GetFundingStatusOutput> {
+  const { funding } = getProviders();
+  const session = await funding.getSession(args.sessionId);
+  if (!session) {
+    return {
+      sessionId: args.sessionId,
+      status: "failed",
+      mode: "simulator",
+      simulated: true,
+      errorMessage: "Funding session not found.",
+    };
+  }
+  setFunding({
+    sessionId: session.sessionId,
+    intentId: session.intentId,
+    status: session.status,
+    mode: session.mode,
+    simulated: session.simulated,
+    checkoutUrl: session.checkoutUrl,
+    amountFiat: session.amountFiat,
+    fiatCurrency: session.fiatCurrency,
+    productName: session.productName,
+    protocolLabel: session.protocolLabel,
+    destWalletAddress: session.destWalletAddress,
+    txHash: session.txHash,
+    txExplorerUrl: session.txExplorerUrl,
+    errorMessage: session.errorMessage,
   });
   return {
-    approvalId: res.approvalId,
-    status: res.status,
-    errorMessage: res.errorMessage,
+    sessionId: session.sessionId,
+    status: session.status,
+    mode: session.mode,
+    simulated: session.simulated,
+    checkoutUrl: session.checkoutUrl,
+    txHash: session.txHash,
+    txExplorerUrl: session.txExplorerUrl,
+    errorMessage: session.errorMessage,
   };
 }
 

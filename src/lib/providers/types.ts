@@ -5,6 +5,8 @@
  * src/lib/providers/index.ts.
  */
 
+import type { FundingAdapter } from "./funding/types";
+
 export type FiatCurrency = "EUR" | "USD";
 
 export type RiskBand = "conservative" | "moderate" | "aggressive" | "unspecified";
@@ -48,34 +50,6 @@ export interface IntentFactoryAdapter {
   getIntent(id: string): Promise<Intent | null>;
 }
 
-export interface ApprovalRequest {
-  intentId: string;
-  amountFiat: number;
-  fiatCurrency: FiatCurrency;
-}
-
-export type ApprovalStatus = "pending" | "approved" | "declined";
-
-export interface ApprovalResult {
-  approvalId: string;
-  intentId: string;
-  status: ApprovalStatus;
-  errorMessage?: string;
-}
-
-/**
- * Revolut adapter — approval channel, NOT a funding rail.
- *
- * `requestApproval()` mocks the "push notification to the caller's phone"
- * moment. The UI reveals a phone-frame with Approve / Decline buttons; tapping
- * one calls the approval store, which flips the result on the next
- * `getApprovalStatus()` poll.
- */
-export interface RevolutAdapter {
-  requestApproval(req: ApprovalRequest): Promise<ApprovalResult>;
-  getApprovalStatus(approvalId: string): Promise<ApprovalResult>;
-}
-
 export interface Utterance {
   text: string;
   finalized: boolean;
@@ -91,7 +65,7 @@ export interface TelephonyAdapter {
 export interface Providers {
   earn: EarnAdapter;
   intentFactory: IntentFactoryAdapter;
-  revolut: RevolutAdapter;
+  funding: FundingAdapter;
   pricing: import("./pricing/types").PricingAdapter;
   telephony?: TelephonyAdapter;
 }

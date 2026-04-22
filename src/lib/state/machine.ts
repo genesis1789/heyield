@@ -6,16 +6,23 @@ const TRANSITIONS: Partial<Record<DemoStatus, Partial<Record<DemoEvent["type"], 
   idle: { CALL_STARTED: "call_active" },
   call_active: { RECOMMENDATION_READY: "recommended" },
   recommended: {
-    USER_CONFIRMED: "approval_pending",
-    USER_DECLINED: "declined",
+    USER_CONFIRMED: "awaiting_checkout",
+    USER_DECLINED: "cancelled",
   },
-  approval_pending: {
-    APPROVAL_APPROVED: "completed",
-    APPROVAL_DECLINED: "declined",
+  awaiting_checkout: {
+    PAYMENT_RECEIVED: "payment_received",
+    CANCELLED: "cancelled",
+  },
+  payment_received: {
+    CRYPTO_IN_FLIGHT: "routing_to_yield",
+    INVESTED: "invested",
+  },
+  routing_to_yield: {
+    INVESTED: "invested",
   },
 };
 
-const TERMINAL: DemoStatus[] = ["completed", "declined", "failed"];
+const TERMINAL: DemoStatus[] = ["invested", "cancelled", "failed"];
 
 export function transition(state: DemoState, event: DemoEvent): DemoState {
   if (event.type === "RESET") return initialState();

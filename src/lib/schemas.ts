@@ -56,19 +56,6 @@ export const VapiToolCallsMessageSchema = z.object({
     .passthrough(),
 });
 
-/**
- * Broader Vapi server-message schema — we accept many types over the same
- * /api/vapi/webhook URL (Vapi uses one server URL for everything).
- *
- * Documented types we handle:
- *   - tool-calls (handled above — drives our 4 tool dispatchers)
- *   - transcript (live transcription lines, both user + assistant)
- *   - status-update (call lifecycle: queued/ringing/in-progress/ended/…)
- *   - end-of-call-report (final artifact after hangup)
- *
- * Every other message type returns 200 with no side-effect.
- */
-
 export const VapiTranscriptMessageSchema = z.object({
   message: z
     .object({
@@ -80,10 +67,6 @@ export const VapiTranscriptMessageSchema = z.object({
     .passthrough(),
 });
 
-/**
- * Vapi occasionally adds lifecycle statuses without much ceremony. We keep the
- * parser open so the webhook doesn't start 400'ing on new status strings.
- */
 export const VapiCallStatusSchema = z.string().min(1);
 export type VapiCallStatus = z.infer<typeof VapiCallStatusSchema>;
 
@@ -106,7 +89,6 @@ export const VapiEndOfCallMessageSchema = z.object({
     .passthrough(),
 });
 
-/** Any message at all — we at least validate the envelope. */
 export const VapiServerMessageSchema = z.object({
   message: z.object({ type: z.string() }).passthrough(),
 });
@@ -118,15 +100,36 @@ export const RecommendToolArgsSchema = z.object({
 });
 export type RecommendToolArgs = z.infer<typeof RecommendToolArgsSchema>;
 
-export const CreateApprovalToolArgsSchema = z.object({
+/**
+ * Tool args for `startFunding` (also accepted as the legacy
+ * `createApproval` alias so older assistant configurations keep working).
+ */
+export const StartFundingToolArgsSchema = z.object({
+  intentId: z.string().min(1),
+  amountFiat: z.number().positive().optional(),
+  fiatCurrency: z.enum(["EUR", "USD"]).optional(),
+});
+export type StartFundingToolArgs = z.infer<typeof StartFundingToolArgsSchema>;
+
+export const GetFundingStatusToolArgsSchema = z.object({
+  sessionId: z.string().min(1),
+});
+export type GetFundingStatusToolArgs = z.infer<
+  typeof GetFundingStatusToolArgsSchema
+>;
+
+/**
+ * Legacy approval-based schemas. Kept so the webhook can quietly accept
+ * assistant configurations that haven't been migrated yet — the handler
+ * maps them onto the funding tools.
+ */
+export const LegacyCreateApprovalArgsSchema = z.object({
   intentId: z.string().min(1),
 });
-export type CreateApprovalToolArgs = z.infer<typeof CreateApprovalToolArgsSchema>;
-
-export const GetApprovalStatusToolArgsSchema = z.object({
-  approvalId: z.string().min(1),
-});
-export type GetApprovalStatusToolArgs = z.infer<typeof GetApprovalStatusToolArgsSchema>;
+export const LegacyGetApprovalStatusArgsSchema = z.union([
+  z.object({ approvalId: z.string().min(1) }),
+  z.object({ sessionId: z.string().min(1) }),
+]);
 
 export const EndCallToolArgsSchema = z.object({
   reason: z.string().optional(),
@@ -135,10 +138,10 @@ export type EndCallToolArgs = z.infer<typeof EndCallToolArgsSchema>;
 
 // ─── Dashboard REST schemas ────────────────────────────────────────────────
 
-export const ApprovalTapBodySchema = z.object({
-  decision: z.enum(["approve", "decline"]),
+export const FundingAdvanceBodySchema = z.object({
+  event: z.enum(["confirm_payment", "cancel"]),
 });
-export type ApprovalTapBody = z.infer<typeof ApprovalTapBodySchema>;
+export type FundingAdvanceBody = z.infer<typeof FundingAdvanceBodySchema>;
 
 /**
  * E.164 phone number validation — leading "+" then 8–15 digits. Matches what

@@ -1,4 +1,8 @@
-import type { ApprovalStatus } from "@/lib/providers/types";
+import type {
+  FundingProviderKind,
+  FundingStatus,
+} from "@/lib/providers/funding/types";
+import type { FiatCurrency } from "@/lib/providers/types";
 import type { VapiCallStatus } from "@/lib/schemas";
 import type { RecommendOutput } from "./tools";
 import { readJsonFile, writeJsonFile } from "@/lib/server/jsonStore";
@@ -8,12 +12,12 @@ import { readJsonFile, writeJsonFile } from "@/lib/server/jsonStore";
  *
  * Tool calls AND transcript + status-update messages from Vapi all land here
  * via /api/vapi/webhook. The dashboard polls GET /api/agent/session to render
- * transcript, product card, approval push, and timeline — works identically
- * for web calls and inbound phone calls.
+ * transcript, product card, funding handoff, investment timeline — works
+ * identically for web and phone calls.
  *
- * This is file-backed rather than in-memory because Next dev can serve route
- * handlers from different contexts; webhook writes must be visible to the
- * session poll and approval-tap route immediately.
+ * File-backed because Next dev can serve route handlers from different
+ * contexts; webhook writes must be visible to the dashboard poll and the
+ * `/checkout/[id]` advance route immediately.
  */
 
 export interface TranscriptEntry {
@@ -26,14 +30,26 @@ export interface TranscriptEntry {
 
 export type CallStatus = "idle" | VapiCallStatus;
 
+export interface SessionFundingState {
+  sessionId: string;
+  intentId: string;
+  status: FundingStatus;
+  mode: FundingProviderKind;
+  simulated: boolean;
+  checkoutUrl: string;
+  amountFiat: number;
+  fiatCurrency: FiatCurrency;
+  productName: string;
+  protocolLabel: string;
+  destWalletAddress?: string;
+  txHash?: string;
+  txExplorerUrl?: string;
+  errorMessage?: string;
+}
+
 export interface AgentSession {
   recommendation: RecommendOutput | null;
-  approval: {
-    approvalId: string;
-    intentId: string;
-    status: ApprovalStatus;
-    errorMessage?: string;
-  } | null;
+  funding: SessionFundingState | null;
   transcript: TranscriptEntry[];
   callStatus: CallStatus;
   /** Monotonic epoch ms — bumped on every write so clients can detect changes. */
@@ -51,7 +67,7 @@ const COUNTER_FILE = "agent-session-counter.json";
 
 const EMPTY_SESSION: AgentSession = {
   recommendation: null,
-  approval: null,
+  funding: null,
   transcript: [],
   callStatus: "idle",
   updatedAt: 0,
@@ -83,17 +99,12 @@ export function setRecommendation(rec: RecommendOutput): void {
   touch(s);
 }
 
-export function setApproval(approval: NonNullable<AgentSession["approval"]>): void {
+export function setFunding(funding: SessionFundingState): void {
   const s = store();
-  s.approval = approval;
+  s.funding = funding;
   touch(s);
 }
 
-/**
- * Append a transcript chunk. Behaviour matches the familiar client-side
- * rule: if the previous entry is a partial from the same speaker, replace
- * it in place; otherwise append a new entry.
- */
 export function appendTranscript(
   role: "user" | "assistant",
   text: string,
@@ -137,13 +148,14 @@ export function replaceTranscript(entries: SessionTranscriptInput[]): void {
 /**
  * Update call status. If the call is transitioning from a non-in-progress
  * state into `in-progress`, wipe the session first — a fresh call shouldn't
- * see stale transcript / recommendation / approval from the previous one.
+ * see stale transcript / recommendation / funding session from the previous
+ * one.
  */
 export function setCallStatus(status: CallStatus): void {
   const s = store();
   if (status === "in-progress" && s.callStatus !== "in-progress") {
     s.recommendation = null;
-    s.approval = null;
+    s.funding = null;
     s.transcript = [];
   }
   s.callStatus = status;

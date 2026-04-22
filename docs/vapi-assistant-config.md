@@ -85,10 +85,10 @@ Restart `npm run dev` after editing.
    - Greet the caller in one short sentence and ask what they'd like to do with their idle cash.
    - Once you have an amount and currency, call the `recommend` tool with { amountFiat, fiatCurrency }. fiatCurrency defaults to "EUR".
    - When `recommend` returns, explain the product in under 30 seconds: name, APY, estimated annual return for the caller's amount, fees, ONE short risk sentence. End with a confirmation question like "Do you want to go ahead with <amount> into <productName>?"
-   - If the caller says yes, call `createApproval` with { intentId } from the previous recommend result. Then tell them: "Sending a confirmation request to your Revolut app — please approve on your phone."
-   - After `createApproval`, call `getApprovalStatus({ approvalId })` every 2–3 seconds until status is "approved" or "declined". Stay quiet between polls unless more than 6 seconds pass without resolution — then reassure the caller.
-   - When status is "approved", say: "Your request has been confirmed." then call `endCall` with reason="approved".
-   - When status is "declined", say: "The request was declined. Let me know if you'd like to try again." then call `endCall` with reason="declined".
+   - If the caller says yes, call `startFunding` with { intentId } from the previous recommend result. Then tell them: "I'm opening a Revolut checkout on your dashboard — tap Continue in Revolut and pay there."
+   - After `startFunding`, call `getFundingStatus({ sessionId })` every 2–3 seconds until status is "invested", "cancelled", or "failed". Stay quiet between polls unless more than 6 seconds pass without resolution — then briefly reassure the caller ("Still waiting for the payment to settle…").
+   - When status is "invested", say: "Your money is live and earning on Aave." then call `endCall` with reason="invested".
+   - When status is "cancelled" or "failed", say: "The payment didn't go through. Let me know if you'd like to try again." then call `endCall` with reason matching the outcome.
    - Never invent numbers. Never recommend a second product. Never hedge into general financial advice. Never read the JSON aloud.
    ```
 
@@ -151,12 +151,12 @@ Parameters (paste as JSON):
 }
 ```
 
-### Tool 2 — `createApproval`
+### Tool 2 — `startFunding`
 
 | Field | Value |
 | --- | --- |
-| Name | `createApproval` |
-| Description | `Trigger a Revolut push notification to the caller's phone once they have verbally agreed. Call this immediately after the caller says yes.` |
+| Name | `startFunding` |
+| Description | `Create a Revolut hosted checkout the caller will pay from. Call this immediately after the caller says yes. Returns { sessionId, checkoutUrl, status, simulated } — the dashboard will render the handoff card automatically; the caller pays in the browser.` |
 | Async | off |
 
 Parameters:
@@ -174,12 +174,12 @@ Parameters:
 }
 ```
 
-### Tool 3 — `getApprovalStatus`
+### Tool 3 — `getFundingStatus`
 
 | Field | Value |
 | --- | --- |
-| Name | `getApprovalStatus` |
-| Description | `Poll the approval record for its current state. Call every 2–3 seconds after createApproval until status is "approved" or "declined".` |
+| Name | `getFundingStatus` |
+| Description | `Poll the funding session for its current state. Call every 2–3 seconds after startFunding until status is "invested", "cancelled", or "failed". Expected lifecycle: awaiting_checkout → payment_received → routing_to_yield → invested.` |
 | Async | off |
 
 Parameters:
@@ -188,14 +188,16 @@ Parameters:
 {
   "type": "object",
   "properties": {
-    "approvalId": {
+    "sessionId": {
       "type": "string",
-      "description": "The approvalId returned by createApproval."
+      "description": "The sessionId returned by startFunding."
     }
   },
-  "required": ["approvalId"]
+  "required": ["sessionId"]
 }
 ```
+
+> **Legacy aliases.** If your assistant was built before the funding rework, it may still reference `createApproval` / `getApprovalStatus`. The webhook accepts both names and routes them onto the new funding tools, so you can migrate at your own pace. Renaming is still recommended because the new names match the user-facing copy.
 
 ### Tool 4 — `endCall`
 
@@ -239,9 +241,11 @@ Parameters:
 3. Say: *"I have 1000 euros sitting idle and want a better yield."*
 4. Agent should explain Aave v3 USDC and ask for confirmation.
 5. Say: *"Yes."*
-6. Dashboard shows the **Revolut push** card. Tap **Approve**.
-7. Agent should say *"Your request has been confirmed."* within ~2–3 seconds.
-8. Timeline settles on Completed.
+6. Dashboard shows the **Revolut payment** handoff card. Tap **Continue in Revolut**; a Revolut-styled checkout opens in a new tab.
+7. Click **Pay** on the checkout page. Return to the dashboard.
+8. The **Investment progress** timeline advances: Paying → Payment received → Supplying liquidity → Earning.
+9. The **Now earning** card renders with APY, estimated yearly return, and (in `merchant-onchain` mode) a Sepolia tx hash link.
+10. Agent says *"Your money is live and earning on Aave."* and hangs up.
 
 ### If something breaks
 
@@ -293,8 +297,8 @@ Identical to a web call:
 
 - Your transcript and the agent's replies stream into the **Transcript** pane as they happen.
 - When the agent calls `recommend`, the **Recommendation** card renders.
-- When the agent calls `createApproval`, the **Revolut push** appears — tap Approve on your laptop while still on the phone.
-- Timeline settles on Completed; status badge shows the end state.
+- When the agent calls `startFunding`, the **Revolut payment** handoff card appears — tap Continue in Revolut on your laptop while still on the phone, complete payment, then come back.
+- Timeline advances through payment received → routing to yield → earning; the **Now earning** card renders the final investment summary.
 
 This works because the server-side session ([`src/lib/agent/session.ts`](src/lib/agent/session.ts)) is the single source of truth. Web and phone calls both drive it through the same webhook; the dashboard polls every 750 ms and renders whatever's there.
 

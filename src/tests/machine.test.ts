@@ -6,7 +6,9 @@ const HAPPY_SEQUENCE: DemoEvent[] = [
   { type: "CALL_STARTED" },
   { type: "RECOMMENDATION_READY" },
   { type: "USER_CONFIRMED" },
-  { type: "APPROVAL_APPROVED" },
+  { type: "PAYMENT_RECEIVED" },
+  { type: "CRYPTO_IN_FLIGHT" },
+  { type: "INVESTED" },
 ];
 
 describe("state machine", () => {
@@ -14,38 +16,42 @@ describe("state machine", () => {
     expect(initialState()).toEqual({ status: "idle" });
   });
 
-  it("walks the happy path: idle → call_active → recommended → approval_pending → completed", () => {
+  it("walks the happy path: idle → call_active → recommended → awaiting_checkout → payment_received → routing_to_yield → invested", () => {
     let s = initialState();
     const visited: string[] = [s.status];
     for (const ev of HAPPY_SEQUENCE) {
       s = transition(s, ev);
       visited.push(s.status);
     }
-    expect(s.status).toBe("completed");
+    expect(s.status).toBe("invested");
     expect(isTerminal(s)).toBe(true);
     expect(visited).toEqual([
       "idle",
       "call_active",
       "recommended",
-      "approval_pending",
-      "completed",
+      "awaiting_checkout",
+      "payment_received",
+      "routing_to_yield",
+      "invested",
     ]);
   });
 
-  it("verbal decline at the recommended step lands on declined", () => {
+  it("verbal decline at the recommended step lands on cancelled", () => {
     let s = initialState();
     s = transition(s, { type: "CALL_STARTED" });
     s = transition(s, { type: "RECOMMENDATION_READY" });
     s = transition(s, { type: "USER_DECLINED" });
-    expect(s.status).toBe("declined");
+    expect(s.status).toBe("cancelled");
     expect(isTerminal(s)).toBe(true);
   });
 
-  it("phone-tap decline during approval_pending lands on declined", () => {
+  it("cancel during awaiting_checkout lands on cancelled", () => {
     let s = initialState();
-    for (const ev of HAPPY_SEQUENCE.slice(0, 3)) s = transition(s, ev);
-    s = transition(s, { type: "APPROVAL_DECLINED" });
-    expect(s.status).toBe("declined");
+    s = transition(s, { type: "CALL_STARTED" });
+    s = transition(s, { type: "RECOMMENDATION_READY" });
+    s = transition(s, { type: "USER_CONFIRMED" });
+    s = transition(s, { type: "CANCELLED" });
+    expect(s.status).toBe("cancelled");
   });
 
   it("ignores invalid events (no-op)", () => {
@@ -66,7 +72,7 @@ describe("state machine", () => {
     let s = initialState();
     for (const ev of HAPPY_SEQUENCE) s = transition(s, ev);
     const again = transition(s, { type: "CALL_STARTED" });
-    expect(again.status).toBe("completed");
+    expect(again.status).toBe("invested");
     const reset = transition(s, { type: "RESET" });
     expect(reset.status).toBe("idle");
   });
@@ -75,6 +81,16 @@ describe("state machine", () => {
     let s = initialState();
     for (const ev of HAPPY_SEQUENCE) s = transition(s, ev);
     const after = transition(s, { type: "FAIL", reason: "late" });
-    expect(after.status).toBe("completed");
+    expect(after.status).toBe("invested");
+  });
+
+  it("supports skipping the in-flight step straight to invested", () => {
+    let s = initialState();
+    s = transition(s, { type: "CALL_STARTED" });
+    s = transition(s, { type: "RECOMMENDATION_READY" });
+    s = transition(s, { type: "USER_CONFIRMED" });
+    s = transition(s, { type: "PAYMENT_RECEIVED" });
+    s = transition(s, { type: "INVESTED" });
+    expect(s.status).toBe("invested");
   });
 });

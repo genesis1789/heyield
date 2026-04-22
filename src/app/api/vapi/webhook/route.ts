@@ -1,9 +1,11 @@
 import { NextResponse } from "next/server";
 import {
-  CreateApprovalToolArgsSchema,
   EndCallToolArgsSchema,
-  GetApprovalStatusToolArgsSchema,
+  GetFundingStatusToolArgsSchema,
+  LegacyCreateApprovalArgsSchema,
+  LegacyGetApprovalStatusArgsSchema,
   RecommendToolArgsSchema,
+  StartFundingToolArgsSchema,
   VapiEndOfCallMessageSchema,
   VapiServerMessageSchema,
   VapiStatusUpdateMessageSchema,
@@ -11,10 +13,10 @@ import {
   VapiTranscriptMessageSchema,
 } from "@/lib/schemas";
 import {
-  createApproval,
   endCall,
-  getApprovalStatus,
+  getFundingStatus,
   recommend,
+  startFunding,
 } from "@/lib/agent/tools";
 import {
   appendTranscript,
@@ -32,6 +34,17 @@ export const dynamic = "force-dynamic";
  * (feeds the dashboard transcript pane), `status-update` (tracks call
  * lifecycle for the dashboard), and `end-of-call-report` (marks the call
  * ended). All other types are acknowledged with 200 and ignored.
+ *
+ * The canonical tool set is:
+ *   recommend
+ *   startFunding
+ *   getFundingStatus
+ *   endCall
+ *
+ * For backward compatibility with assistant configurations created before
+ * the funding rework, we also accept `createApproval` + `getApprovalStatus`
+ * and route them onto the funding tools — so operators don't have to
+ * update the Vapi dashboard before the demo works.
  *
  * Auth: when VAPI_WEBHOOK_SECRET is set, the request must carry an
  * `x-vapi-secret` header matching it.
@@ -62,12 +75,30 @@ async function dispatchTool(toolName: string, args: unknown): Promise<unknown> {
   switch (toolName) {
     case "recommend":
       return recommend(RecommendToolArgsSchema.parse(args));
-    case "createApproval":
-      return createApproval(CreateApprovalToolArgsSchema.parse(args));
-    case "getApprovalStatus":
-      return getApprovalStatus(GetApprovalStatusToolArgsSchema.parse(args));
+
+    case "startFunding":
+      return startFunding(StartFundingToolArgsSchema.parse(args));
+
+    case "getFundingStatus":
+      return getFundingStatus(GetFundingStatusToolArgsSchema.parse(args));
+
     case "endCall":
       return endCall(EndCallToolArgsSchema.parse(args));
+
+    // Legacy aliases — older Vapi assistants still reference these. We
+    // route them onto the new funding tools so migration can happen at
+    // the operator's pace without breaking the live demo.
+    case "createApproval": {
+      const legacy = LegacyCreateApprovalArgsSchema.parse(args);
+      return startFunding({ intentId: legacy.intentId });
+    }
+    case "getApprovalStatus": {
+      const legacy = LegacyGetApprovalStatusArgsSchema.parse(args);
+      const sessionId =
+        "sessionId" in legacy ? legacy.sessionId : legacy.approvalId;
+      return getFundingStatus({ sessionId });
+    }
+
     default:
       throw new Error(`Unknown tool: ${toolName}`);
   }
@@ -246,7 +277,6 @@ function handleTranscript(body: unknown) {
 
   const fallback = coerceTranscriptMessage(body);
   if (!fallback) {
-    // Do not fail the whole webhook on non-critical transcript variants.
     return NextResponse.json({ received: true, ignored: "invalid transcript payload" });
   }
 
@@ -311,8 +341,6 @@ export async function POST(req: Request) {
     case "end-of-call-report":
       return handleEndOfCall(body);
     default:
-      // Many other Vapi message types exist (conversation-update, speech-update,
-      // user-interrupted, model-output, hang, …). We don't need them for the demo.
       return NextResponse.json({ received: true, ignored: envelope.data.message.type });
   }
 }

@@ -4,25 +4,48 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { createTelephony, telephonyProviderLabel } from "@/lib/providers/telephony/factory";
 import { initialState, transition } from "@/lib/state/machine";
 import type { DemoEvent, DemoState } from "@/lib/state/types";
-import type { ApprovalStatus } from "@/lib/providers/types";
+import type {
+  FundingProviderKind,
+  FundingStatus,
+} from "@/lib/providers/funding/types";
 import type { CallStatus, TranscriptEntry } from "@/lib/agent/session";
 import { CallControl } from "./CallControl";
 import { TranscriptPane } from "./TranscriptPane";
-import { RecommendationCard, type RecommendationSummary } from "./RecommendationCard";
-import { PhonePushCard } from "./PhonePushCard";
-import { StatusTimeline } from "./StatusTimeline";
 import { DevControls } from "./DevControls";
+import { StageLinkCard } from "./operator/StageLinkCard";
+import { StageMirror } from "./operator/StageMirror";
 
 const SESSION_POLL_MS = 750;
 
+interface FundingView {
+  sessionId: string;
+  intentId: string;
+  status: FundingStatus;
+  mode: FundingProviderKind;
+  simulated: boolean;
+  checkoutUrl: string;
+  amountFiat: number;
+  fiatCurrency: "EUR" | "USD";
+  productName: string;
+  protocolLabel: string;
+  destWalletAddress?: string;
+  txHash?: string;
+  txExplorerUrl?: string;
+  errorMessage?: string;
+}
+
+interface RecommendationView {
+  intentId: string;
+  productName: string;
+  chain: string;
+  apyPct: number;
+  amountFiat: number;
+  fiatCurrency: "EUR" | "USD";
+}
+
 interface AgentSessionView {
-  recommendation: (RecommendationSummary & { intentId: string }) | null;
-  approval: {
-    approvalId: string;
-    intentId: string;
-    status: ApprovalStatus;
-    errorMessage?: string;
-  } | null;
+  recommendation: RecommendationView | null;
+  funding: FundingView | null;
   transcript: TranscriptEntry[];
   callStatus: CallStatus;
   updatedAt: number;
@@ -30,24 +53,32 @@ interface AgentSessionView {
 
 const IDLE_SESSION: AgentSessionView = {
   recommendation: null,
-  approval: null,
+  funding: null,
   transcript: [],
   callStatus: "idle",
   updatedAt: 0,
 };
 
-function deriveStateFromSession(session: AgentSessionView, prev: DemoState): DemoState {
-  if (session.approval?.status === "approved") {
-    return { status: "completed" };
-  }
-  if (session.approval?.status === "declined") {
-    return {
-      status: "declined",
-      error: session.approval.errorMessage ?? prev.error,
-    };
-  }
-  if (session.approval) {
-    return { status: "approval_pending" };
+function deriveStateFromSession(
+  session: AgentSessionView,
+  prev: DemoState,
+): DemoState {
+  const f = session.funding;
+  if (f) {
+    switch (f.status) {
+      case "invested":
+        return { status: "invested" };
+      case "failed":
+        return { status: "failed", error: f.errorMessage ?? prev.error };
+      case "cancelled":
+        return { status: "cancelled", error: f.errorMessage ?? prev.error };
+      case "routing_to_yield":
+        return { status: "routing_to_yield" };
+      case "payment_received":
+        return { status: "payment_received" };
+      case "awaiting_checkout":
+        return { status: "awaiting_checkout" };
+    }
   }
   if (session.recommendation) {
     return { status: "recommended" };
@@ -58,6 +89,14 @@ function deriveStateFromSession(session: AgentSessionView, prev: DemoState): Dem
   return prev.status === "failed" ? prev : initialState();
 }
 
+/**
+ * Operator console. Drives the call, shows what the agent is doing, and
+ * mirrors the audience-facing `/stage` view in a phone-shaped iframe so the
+ * operator can see the phone without looking at it.
+ *
+ * All audience-facing UI (recommendation, handoff, investment timeline,
+ * success) lives on `/stage` and is intentionally NOT duplicated here.
+ */
 export function CallSimulator() {
   const telephony = useMemo(() => createTelephony(), []);
   const [provider, setProvider] = useState<"vapi" | "browser">("browser");
@@ -77,10 +116,6 @@ export function CallSimulator() {
     setState((s) => transition(s, ev));
   }, []);
 
-  // ─── Always-on session poll ─────────────────────────────────────────────
-  // We poll regardless of which channel started the call (web click OR
-  // inbound dial), so the dashboard reflects whatever Vapi is doing right
-  // now. When state is terminal, we back off.
   useEffect(() => {
     let cancelled = false;
     const tick = async () => {
@@ -103,18 +138,18 @@ export function CallSimulator() {
     };
   }, []);
 
-  // ─── Reconcile dashboard state to the latest server snapshot ────────────
   const callLive = session.callStatus === "in-progress";
   const callEnded = session.callStatus === "ended";
 
   useEffect(() => {
     setState((prev) => {
       const next = deriveStateFromSession(session, prev);
-      return next.status === prev.status && next.error === prev.error ? prev : next;
+      return next.status === prev.status && next.error === prev.error
+        ? prev
+        : next;
     });
   }, [session]);
 
-  // ─── Web-call lifecycle: only the "Start call" button uses this ────────
   const startWebCall = useCallback(async () => {
     if (connecting || callLive) return;
     setConnecting(true);
@@ -125,12 +160,7 @@ export function CallSimulator() {
     }
     dispatch({ type: "RESET" });
     try {
-      await telephony.start(() => {
-        // Transcripts now come from the server-side poll; we intentionally
-        // ignore the client-side utterance callback so web + phone calls
-        // render identically.
-      });
-      // session poll will pick up status "in-progress" once Vapi connects.
+      await telephony.start(() => {});
     } catch (err) {
       dispatch({
         type: "FAIL",
@@ -160,106 +190,138 @@ export function CallSimulator() {
     setSession(IDLE_SESSION);
   }, [dispatch, endWebCall]);
 
-  const onTap = useCallback(
-    async (decision: "approve" | "decline") => {
-      if (!session.approval) return;
-      try {
-        await fetch(`/api/approvals/${session.approval.approvalId}/tap`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ decision }),
-        });
-      } catch {
-        // the poll will reconcile
-      }
-    },
-    [session.approval],
-  );
-
-  const approvalOutcome: "approved" | "declined" | null =
-    session.approval?.status === "approved"
-      ? "approved"
-      : session.approval?.status === "declined"
-        ? "declined"
-        : null;
-
-  const amountLabel = session.recommendation
-    ? new Intl.NumberFormat(
-        session.recommendation.fiatCurrency === "EUR" ? "en-IE" : "en-US",
-        {
-          style: "currency",
-          currency: session.recommendation.fiatCurrency,
-          maximumFractionDigits: 0,
-        },
-      ).format(session.recommendation.amountFiat)
-    : "";
-
-  const showPush =
-    session.recommendation !== null &&
-    session.approval !== null &&
-    (state.status === "approval_pending" || approvalOutcome !== null);
-
   const showStartOver =
-    state.status === "completed" ||
-    state.status === "declined" ||
+    state.status === "invested" ||
+    state.status === "cancelled" ||
     state.status === "failed" ||
     callEnded;
 
   return (
-    <div className="space-y-5">
-      <CallControl
-        active={callLive}
-        connecting={connecting}
-        disabled={provider === "browser" && !supported}
-        provider={provider}
-        phoneNumber={phoneNumber}
-        onStart={startWebCall}
-        onEnd={endWebCall}
-      />
-
-      {provider === "browser" && (
-        <section className="rounded-2xl border border-dashed border-amber-300 bg-amber-50/70 p-4 text-sm text-amber-900">
-          <p className="font-medium">Preview mode — no Vapi agent configured.</p>
-          <p className="mt-1 text-amber-800">
-            Set <code className="font-mono">NEXT_PUBLIC_TELEPHONY_PROVIDER=vapi</code>{" "}
-            plus <code className="font-mono">NEXT_PUBLIC_VAPI_PUBLIC_KEY</code> and{" "}
-            <code className="font-mono">NEXT_PUBLIC_VAPI_ASSISTANT_ID</code> in{" "}
-            <code className="font-mono">.env.local</code> to enable the real voice
-            concierge. See{" "}
-            <code className="font-mono">docs/vapi-assistant-config.md</code>.
-          </p>
-        </section>
-      )}
-
-      <TranscriptPane entries={session.transcript} active={callLive} />
-
-      {session.recommendation && <RecommendationCard summary={session.recommendation} />}
-
-      {showPush && session.approval && session.recommendation && (
-        <PhonePushCard
-          approvalId={session.approval.approvalId}
-          productName={session.recommendation.productName}
-          amountLabel={amountLabel}
-          outcome={approvalOutcome}
-          onTap={onTap}
+    <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_auto]">
+      <div className="space-y-5">
+        <CallControl
+          active={callLive}
+          connecting={connecting}
+          disabled={provider === "browser" && !supported}
+          provider={provider}
+          phoneNumber={phoneNumber}
+          onStart={startWebCall}
+          onEnd={endWebCall}
         />
-      )}
 
-      {session.recommendation && <StatusTimeline state={state} />}
+        <StageLinkCard />
 
-      {showStartOver && (
-        <div className="flex justify-end">
-          <button
-            type="button"
-            onClick={reset}
-            className="text-xs font-medium text-brand hover:text-brand-700"
-          >
-            Start over
-          </button>
+        {provider === "browser" && (
+          <section className="rounded-2xl border border-dashed border-amber-300 bg-amber-50/70 p-4 text-xs text-amber-900">
+            <p className="font-semibold uppercase tracking-wide text-amber-700">
+              Preview mode
+            </p>
+            <p className="mt-1 leading-relaxed">
+              No Vapi agent configured. The stage still renders state changes
+              driven by tool calls, but no voice agent is running. Set{" "}
+              <code className="font-mono">NEXT_PUBLIC_TELEPHONY_PROVIDER=vapi</code>
+              {" "}+ Vapi keys in{" "}
+              <code className="font-mono">.env.local</code> to enable it.
+            </p>
+          </section>
+        )}
+
+        <TranscriptPane entries={session.transcript} active={callLive} />
+
+        <OperatorDiagnostics
+          state={state}
+          session={session}
+        />
+
+        {showStartOver && (
+          <div className="flex justify-end">
+            <button
+              type="button"
+              onClick={reset}
+              className="text-xs font-medium text-brand hover:text-brand-700"
+            >
+              Start over
+            </button>
+          </div>
+        )}
+
+        <DevControls />
+      </div>
+
+      <div className="hidden lg:block">
+        <div className="sticky top-6 space-y-5">
+          <StageMirror />
         </div>
-      )}
-
-      <DevControls />
+      </div>
     </div>
+  );
+}
+
+function OperatorDiagnostics({
+  state,
+  session,
+}: {
+  state: DemoState;
+  session: AgentSessionView;
+}) {
+  return (
+    <section className="rounded-2xl border border-slate-200 bg-white p-4 text-xs text-slate-600 shadow-card">
+      <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
+        Session
+      </p>
+      <dl className="mt-3 grid grid-cols-2 gap-x-4 gap-y-2 font-mono text-[11px]">
+        <Row label="Call" value={session.callStatus} />
+        <Row label="Demo state" value={state.status} />
+        <Row
+          label="Recommendation"
+          value={
+            session.recommendation
+              ? `${session.recommendation.productName} · ${session.recommendation.apyPct.toFixed(2)}%`
+              : "—"
+          }
+        />
+        <Row
+          label="Funding mode"
+          value={session.funding?.mode ?? "—"}
+        />
+        <Row
+          label="Funding id"
+          value={session.funding?.sessionId ?? "—"}
+        />
+        <Row
+          label="Funding status"
+          value={session.funding?.status ?? "—"}
+        />
+        <Row
+          label="Tx hash"
+          value={
+            session.funding?.txHash
+              ? `${session.funding.txHash.slice(0, 6)}…${session.funding.txHash.slice(-4)}`
+              : "—"
+          }
+        />
+      </dl>
+      {session.funding?.checkoutUrl && (
+        <a
+          href={session.funding.checkoutUrl}
+          target="_blank"
+          rel="noreferrer"
+          className="mt-3 inline-flex text-[11px] font-medium text-brand hover:text-brand-700"
+        >
+          Open checkout URL ↗
+        </a>
+      )}
+    </section>
+  );
+}
+
+function Row({ label, value }: { label: string; value: string }) {
+  return (
+    <>
+      <dt className="text-[10px] uppercase tracking-wide text-slate-400">
+        {label}
+      </dt>
+      <dd className="break-all text-slate-800">{value}</dd>
+    </>
   );
 }
