@@ -11,3 +11,13 @@ coverage
 *.log
 .vercel
 .turbo
+
+# TypeScript incremental build artifact
+tsconfig.tsbuildinfo
+
+# Local IDE / agent configs
+.claude/
+.cursor/
+
+# Runtime demo state (ephemeral, per-machine session data)
+.demo-state/
